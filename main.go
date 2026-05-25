@@ -168,23 +168,38 @@ type namespaceTopo struct {
 }
 
 type workloadTopo struct {
-	Kind      string
-	Name      string
-	mids      []midTopo
-	Ready     string
-	UpToDate  int32
-	Available int32
-	Age       string
+	Kind           string
+	Name           string
+	mids           []midTopo
+	Ready          string
+	Desired        int32
+	Current        int32
+	ReadyCount     int32
+	UpToDate       int32
+	Available      int32
+	NodeSelector   string
+	Age            string
+	Schedule       string
+	TimeZone       string
+	Suspend        bool
+	Active         int
+	LastSchedule   string
+	JobStatus      string
+	JobCompletions string
+	JobDuration    string
 }
 
 type midTopo struct {
-	Kind    string
-	Name    string
-	pods    []podTopoItem
-	Desired int32
-	Current int32
-	Ready   int32
-	Age     string
+	Kind           string
+	Name           string
+	pods           []podTopoItem
+	Desired        int32
+	Current        int32
+	Ready          int32
+	Age            string
+	JobStatus      string
+	JobCompletions string
+	JobDuration    string
 }
 
 type podTopoItem struct {
@@ -236,7 +251,10 @@ func collectNamespaceTopologyWithListOptions(ctx context.Context, clientset *kub
 
 	rsCache := map[string]*appsv1.ReplicaSet{}
 	jobCache := map[string]*batchv1.Job{}
+	cronJobCache := map[string]*batchv1.CronJob{}
 	deployCache := map[string]*appsv1.Deployment{}
+	stsCache := map[string]*appsv1.StatefulSet{}
+	dsCache := map[string]*appsv1.DaemonSet{}
 
 	nsMap := map[string]*namespaceTopo{}
 	wlMap := map[string]map[string]*workloadTopo{}
@@ -282,6 +300,57 @@ func collectNamespaceTopologyWithListOptions(ctx context.Context, clientset *kub
 					wt.Age = ageString(dep.CreationTimestamp)
 				}
 			}
+			if strings.ToLower(chain.topKind) == "statefulset" {
+				sts, _ := getStatefulSet(ctx, clientset, p.Namespace, chain.topName, stsCache)
+				if sts != nil {
+					replicas := int32(1)
+					if sts.Spec.Replicas != nil {
+						replicas = *sts.Spec.Replicas
+					}
+					wt.Ready = fmt.Sprintf("%d/%d", sts.Status.ReadyReplicas, replicas)
+					wt.Age = ageString(sts.CreationTimestamp)
+				}
+			}
+			if strings.ToLower(chain.topKind) == "daemonset" {
+				ds, _ := getDaemonSet(ctx, clientset, p.Namespace, chain.topName, dsCache)
+				if ds != nil {
+					wt.Desired = ds.Status.DesiredNumberScheduled
+					wt.Current = ds.Status.CurrentNumberScheduled
+					wt.ReadyCount = ds.Status.NumberReady
+					wt.UpToDate = ds.Status.UpdatedNumberScheduled
+					wt.Available = ds.Status.NumberAvailable
+					wt.NodeSelector = nodeSelectorString(ds.Spec.Template.Spec.NodeSelector)
+					wt.Age = ageString(ds.CreationTimestamp)
+				}
+			}
+			if strings.ToLower(chain.topKind) == "cronjob" {
+				cj, _ := getCronJob(ctx, clientset, p.Namespace, chain.topName, cronJobCache)
+				if cj != nil {
+					wt.Schedule = cj.Spec.Schedule
+					if cj.Spec.TimeZone != nil && strings.TrimSpace(*cj.Spec.TimeZone) != "" {
+						wt.TimeZone = *cj.Spec.TimeZone
+					} else {
+						wt.TimeZone = "<none>"
+					}
+					wt.Suspend = cj.Spec.Suspend != nil && *cj.Spec.Suspend
+					wt.Active = len(cj.Status.Active)
+					if cj.Status.LastScheduleTime != nil {
+						wt.LastSchedule = ageString(*cj.Status.LastScheduleTime)
+					} else {
+						wt.LastSchedule = "<none>"
+					}
+					wt.Age = ageString(cj.CreationTimestamp)
+				}
+			}
+			if strings.ToLower(chain.topKind) == "job" {
+				j, _ := getJob(ctx, clientset, p.Namespace, chain.topName, jobCache)
+				if j != nil {
+					wt.JobStatus = jobStatusString(j)
+					wt.JobCompletions = jobCompletionsString(j)
+					wt.JobDuration = jobDurationString(j)
+					wt.Age = ageString(j.CreationTimestamp)
+				}
+			}
 		}
 
 		if midMap[p.Namespace] == nil {
@@ -306,6 +375,15 @@ func collectNamespaceTopologyWithListOptions(ctx context.Context, clientset *kub
 					mt.Current = rs.Status.Replicas
 					mt.Ready = rs.Status.ReadyReplicas
 					mt.Age = ageString(rs.CreationTimestamp)
+				}
+			}
+			if strings.ToLower(chain.midKind) == "job" && chain.midName != "" {
+				j, _ := getJob(ctx, clientset, p.Namespace, chain.midName, jobCache)
+				if j != nil {
+					mt.JobStatus = jobStatusString(j)
+					mt.JobCompletions = jobCompletionsString(j)
+					mt.JobDuration = jobDurationString(j)
+					mt.Age = ageString(j.CreationTimestamp)
 				}
 			}
 		}
@@ -554,7 +632,10 @@ func ageString(ts metav1.Time) string {
 func buildWorkloadTopoForPods(ctx context.Context, clientset *kubernetes.Clientset, ns string, pods []corev1.Pod, includeStandalone bool, rsCache map[string]*appsv1.ReplicaSet, jobCache map[string]*batchv1.Job) ([]workloadTopo, error) {
 	wlMap := map[string]*workloadTopo{}
 	midMap := map[string]map[string]*midTopo{}
+	cronJobCache := map[string]*batchv1.CronJob{}
 	deployCache := map[string]*appsv1.Deployment{}
+	stsCache := map[string]*appsv1.StatefulSet{}
+	dsCache := map[string]*appsv1.DaemonSet{}
 
 	for i := range pods {
 		p := pods[i]
@@ -589,6 +670,57 @@ func buildWorkloadTopoForPods(ctx context.Context, clientset *kubernetes.Clients
 					wt.Age = ageString(dep.CreationTimestamp)
 				}
 			}
+			if strings.ToLower(chain.topKind) == "statefulset" {
+				sts, _ := getStatefulSet(ctx, clientset, ns, chain.topName, stsCache)
+				if sts != nil {
+					replicas := int32(1)
+					if sts.Spec.Replicas != nil {
+						replicas = *sts.Spec.Replicas
+					}
+					wt.Ready = fmt.Sprintf("%d/%d", sts.Status.ReadyReplicas, replicas)
+					wt.Age = ageString(sts.CreationTimestamp)
+				}
+			}
+			if strings.ToLower(chain.topKind) == "daemonset" {
+				ds, _ := getDaemonSet(ctx, clientset, ns, chain.topName, dsCache)
+				if ds != nil {
+					wt.Desired = ds.Status.DesiredNumberScheduled
+					wt.Current = ds.Status.CurrentNumberScheduled
+					wt.ReadyCount = ds.Status.NumberReady
+					wt.UpToDate = ds.Status.UpdatedNumberScheduled
+					wt.Available = ds.Status.NumberAvailable
+					wt.NodeSelector = nodeSelectorString(ds.Spec.Template.Spec.NodeSelector)
+					wt.Age = ageString(ds.CreationTimestamp)
+				}
+			}
+			if strings.ToLower(chain.topKind) == "cronjob" {
+				cj, _ := getCronJob(ctx, clientset, ns, chain.topName, cronJobCache)
+				if cj != nil {
+					wt.Schedule = cj.Spec.Schedule
+					if cj.Spec.TimeZone != nil && strings.TrimSpace(*cj.Spec.TimeZone) != "" {
+						wt.TimeZone = *cj.Spec.TimeZone
+					} else {
+						wt.TimeZone = "<none>"
+					}
+					wt.Suspend = cj.Spec.Suspend != nil && *cj.Spec.Suspend
+					wt.Active = len(cj.Status.Active)
+					if cj.Status.LastScheduleTime != nil {
+						wt.LastSchedule = ageString(*cj.Status.LastScheduleTime)
+					} else {
+						wt.LastSchedule = "<none>"
+					}
+					wt.Age = ageString(cj.CreationTimestamp)
+				}
+			}
+			if strings.ToLower(chain.topKind) == "job" {
+				j, _ := getJob(ctx, clientset, ns, chain.topName, jobCache)
+				if j != nil {
+					wt.JobStatus = jobStatusString(j)
+					wt.JobCompletions = jobCompletionsString(j)
+					wt.JobDuration = jobDurationString(j)
+					wt.Age = ageString(j.CreationTimestamp)
+				}
+			}
 		}
 
 		if midMap[ownerKey] == nil {
@@ -610,6 +742,15 @@ func buildWorkloadTopoForPods(ctx context.Context, clientset *kubernetes.Clients
 					mt.Current = rs.Status.Replicas
 					mt.Ready = rs.Status.ReadyReplicas
 					mt.Age = ageString(rs.CreationTimestamp)
+				}
+			}
+			if strings.ToLower(chain.midKind) == "job" && chain.midName != "" {
+				j, _ := getJob(ctx, clientset, ns, chain.midName, jobCache)
+				if j != nil {
+					mt.JobStatus = jobStatusString(j)
+					mt.JobCompletions = jobCompletionsString(j)
+					mt.JobDuration = jobDurationString(j)
+					mt.Age = ageString(j.CreationTimestamp)
 				}
 			}
 		}
@@ -714,17 +855,38 @@ func printNamespaceTopology(rows []namespaceTopo) {
 				fmt.Fprintf(dw, "%s|NAME\tREADY\tUP-TO-DATE\tAVAILABLE\tAGE\n", wlIndent)
 				fmt.Fprintf(dw, "%s|%s\t%s\t%d\t%d\t%s\n", wlIndent, wl.Name, wl.Ready, wl.UpToDate, wl.Available, valueOrDash(wl.Age))
 				_ = dw.Flush()
+			} else if strings.ToLower(wl.Kind) == "cronjob" {
+				cw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+				fmt.Fprintf(cw, "%s|NAMESPACE\tNAME\tSCHEDULE\tTIMEZONE\tSUSPEND\tACTIVE\tLAST SCHEDULE\tAGE\n", wlIndent)
+				fmt.Fprintf(cw, "%s|%s\t%s\t%s\t%s\t%s\t%d\t%s\t%s\n", wlIndent, n.Namespace, wl.Name, valueOrDash(wl.Schedule), valueOrDash(wl.TimeZone), boolString(wl.Suspend), wl.Active, valueOrDash(wl.LastSchedule), valueOrDash(wl.Age))
+				_ = cw.Flush()
+			} else if strings.ToLower(wl.Kind) == "job" {
+				jw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+				fmt.Fprintf(jw, "%s|NAMESPACE\tNAME\tSTATUS\tCOMPLETIONS\tDURATION\tAGE\n", wlIndent)
+				fmt.Fprintf(jw, "%s|%s\t%s\t%s\t%s\t%s\t%s\n", wlIndent, n.Namespace, wl.Name, valueOrDash(wl.JobStatus), valueOrDash(wl.JobCompletions), valueOrDash(wl.JobDuration), valueOrDash(wl.Age))
+				_ = jw.Flush()
+			} else if strings.ToLower(wl.Kind) == "statefulset" {
+				sw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+				fmt.Fprintf(sw, "%s|NAMESPACE\tNAME\tREADY\tAGE\n", wlIndent)
+				fmt.Fprintf(sw, "%s|%s\t%s\t%s\t%s\n", wlIndent, n.Namespace, wl.Name, valueOrDash(wl.Ready), valueOrDash(wl.Age))
+				_ = sw.Flush()
+			} else if strings.ToLower(wl.Kind) == "daemonset" {
+				dsw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+				fmt.Fprintf(dsw, "%s|NAME\tDESIRED\tCURRENT\tREADY\tUP-TO-DATE\tAVAILABLE\tNODE SELECTOR\tAGE\n", wlIndent)
+				fmt.Fprintf(dsw, "%s|%s\t%d\t%d\t%d\t%d\t%d\t%s\t%s\n", wlIndent, wl.Name, wl.Desired, wl.Current, wl.ReadyCount, wl.UpToDate, wl.Available, valueOrDash(wl.NodeSelector), valueOrDash(wl.Age))
+				_ = dsw.Flush()
 			} else {
 				fmt.Printf("%s|%s/%s pods=%d\n", wlIndent, topoKind(wl.Kind), wl.Name, workloadPodCount(wl))
 			}
 
 			anc := []bool{isLastWl}
-			for mi := range wl.mids {
+			for mi := 0; mi < len(wl.mids); {
 				m := wl.mids[mi]
-				isLastMid := mi == len(wl.mids)-1
-				mBranch, mIndent := treeBranch(anc, isLastMid)
+				isDetailedReplicaSet := strings.ToLower(m.Kind) == "replicaset" && m.Age != ""
 
 				if m.Kind == "" && m.Name == "" {
+					isLastMid := mi == len(wl.mids)-1
+					mBranch, mIndent := treeBranch(anc, isLastMid)
 					fmt.Printf("%sPods\n", mBranch)
 					pw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
 					prefix := mIndent + "|"
@@ -745,10 +907,13 @@ func printNamespaceTopology(rows []namespaceTopo) {
 						)
 					}
 					_ = pw.Flush()
+					mi++
 					continue
 				}
 
-				if strings.ToLower(m.Kind) == "replicaset" && m.Age != "" {
+				if isDetailedReplicaSet {
+					isLastMid := mi == len(wl.mids)-1
+					mBranch, mIndent := treeBranch(anc, isLastMid)
 					fmt.Printf("%sReplicaSet\n", mBranch)
 					rw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
 					fmt.Fprintf(rw, "%s|NAME\tDESIRED\tCURRENT\tREADY\tAGE\n", mIndent)
@@ -776,10 +941,45 @@ func printNamespaceTopology(rows []namespaceTopo) {
 						)
 					}
 					_ = pw.Flush()
+					mi++
 					continue
 				}
 
-				fmt.Printf("%s|%s/%s pods=%d\n", mIndent, topoKind(m.Kind), m.Name, len(m.pods))
+				kindKey := topoKind(m.Kind)
+				j := mi
+				for j < len(wl.mids) {
+					m2 := wl.mids[j]
+					if m2.Kind == "" && m2.Name == "" {
+						break
+					}
+					if strings.ToLower(m2.Kind) == "replicaset" && m2.Age != "" {
+						break
+					}
+					if topoKind(m2.Kind) != kindKey {
+						break
+					}
+					j++
+				}
+
+				isLastGroup := j == len(wl.mids)
+				mBranch, mIndent := treeBranch(anc, isLastGroup)
+				fmt.Printf("%s%s\n", mBranch, strings.Title(kindKey))
+				if kindKey == "job" {
+					jw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+					prefix := mIndent + "|"
+					fmt.Fprintf(jw, "%sNAMESPACE\tNAME\tSTATUS\tCOMPLETIONS\tDURATION\tAGE\n", prefix)
+					for k := mi; k < j; k++ {
+						it := wl.mids[k]
+						fmt.Fprintf(jw, "%s%s\t%s\t%s\t%s\t%s\t%s\n", prefix, n.Namespace, it.Name, valueOrDash(it.JobStatus), valueOrDash(it.JobCompletions), valueOrDash(it.JobDuration), valueOrDash(it.Age))
+					}
+					_ = jw.Flush()
+				} else {
+					for k := mi; k < j; k++ {
+						it := wl.mids[k]
+						fmt.Printf("%s|%s/%s pods=%d\n", mIndent, kindKey, it.Name, len(it.pods))
+					}
+				}
+				mi = j
 			}
 		}
 
@@ -838,21 +1038,43 @@ func printIngressTopology(rows []ingressTopo) {
 					fmt.Fprintf(dw, "%s|NAME\tREADY\tUP-TO-DATE\tAVAILABLE\tAGE\n", wlIndent)
 					fmt.Fprintf(dw, "%s|%s\t%s\t%d\t%d\t%s\n", wlIndent, wl.Name, wl.Ready, wl.UpToDate, wl.Available, valueOrDash(wl.Age))
 					_ = dw.Flush()
+				} else if strings.ToLower(wl.Kind) == "cronjob" {
+					cw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+					fmt.Fprintf(cw, "%s|NAMESPACE\tNAME\tSCHEDULE\tTIMEZONE\tSUSPEND\tACTIVE\tLAST SCHEDULE\tAGE\n", wlIndent)
+					fmt.Fprintf(cw, "%s|%s\t%s\t%s\t%s\t%s\t%d\t%s\t%s\n", wlIndent, r.Namespace, wl.Name, valueOrDash(wl.Schedule), valueOrDash(wl.TimeZone), boolString(wl.Suspend), wl.Active, valueOrDash(wl.LastSchedule), valueOrDash(wl.Age))
+					_ = cw.Flush()
+				} else if strings.ToLower(wl.Kind) == "job" {
+					jw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+					fmt.Fprintf(jw, "%s|NAMESPACE\tNAME\tSTATUS\tCOMPLETIONS\tDURATION\tAGE\n", wlIndent)
+					fmt.Fprintf(jw, "%s|%s\t%s\t%s\t%s\t%s\t%s\n", wlIndent, r.Namespace, wl.Name, valueOrDash(wl.JobStatus), valueOrDash(wl.JobCompletions), valueOrDash(wl.JobDuration), valueOrDash(wl.Age))
+					_ = jw.Flush()
+				} else if strings.ToLower(wl.Kind) == "statefulset" {
+					sw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+					fmt.Fprintf(sw, "%s|NAMESPACE\tNAME\tREADY\tAGE\n", wlIndent)
+					fmt.Fprintf(sw, "%s|%s\t%s\t%s\t%s\n", wlIndent, r.Namespace, wl.Name, valueOrDash(wl.Ready), valueOrDash(wl.Age))
+					_ = sw.Flush()
+				} else if strings.ToLower(wl.Kind) == "daemonset" {
+					dsw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+					fmt.Fprintf(dsw, "%s|NAME\tDESIRED\tCURRENT\tREADY\tUP-TO-DATE\tAVAILABLE\tNODE SELECTOR\tAGE\n", wlIndent)
+					fmt.Fprintf(dsw, "%s|%s\t%d\t%d\t%d\t%d\t%d\t%s\t%s\n", wlIndent, wl.Name, wl.Desired, wl.Current, wl.ReadyCount, wl.UpToDate, wl.Available, valueOrDash(wl.NodeSelector), valueOrDash(wl.Age))
+					_ = dsw.Flush()
 				} else {
 					fmt.Printf("%s|%s/%s pods=%d\n", wlIndent, topoKind(wl.Kind), wl.Name, workloadPodCount(wl))
 				}
 
 				anc2 := append(append([]bool{}, anc...), isLastWl)
-				for mi := range wl.mids {
+				for mi := 0; mi < len(wl.mids); {
 					m := wl.mids[mi]
-					isLastMid := mi == len(wl.mids)-1
-					mBranch, mIndent := treeBranch(anc2, isLastMid)
+					isDetailedReplicaSet := strings.ToLower(m.Kind) == "replicaset" && m.Age != ""
 
 					if m.Kind == "" && m.Name == "" {
+						mi++
 						continue
 					}
 
-					if strings.ToLower(m.Kind) == "replicaset" && m.Age != "" {
+					if isDetailedReplicaSet {
+						isLastMid := mi == len(wl.mids)-1
+						mBranch, mIndent := treeBranch(anc2, isLastMid)
 						fmt.Printf("%sReplicaSet\n", mBranch)
 						rw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
 						fmt.Fprintf(rw, "%s|NAME\tDESIRED\tCURRENT\tREADY\tAGE\n", mIndent)
@@ -878,10 +1100,45 @@ func printIngressTopology(rows []ingressTopo) {
 							)
 						}
 						_ = pw.Flush()
+						mi++
 						continue
 					}
 
-					fmt.Printf("%s|%s/%s pods=%d\n", mIndent, topoKind(m.Kind), m.Name, len(m.pods))
+					kindKey := topoKind(m.Kind)
+					j := mi
+					for j < len(wl.mids) {
+						m2 := wl.mids[j]
+						if m2.Kind == "" && m2.Name == "" {
+							break
+						}
+						if strings.ToLower(m2.Kind) == "replicaset" && m2.Age != "" {
+							break
+						}
+						if topoKind(m2.Kind) != kindKey {
+							break
+						}
+						j++
+					}
+
+					isLastGroup := j == len(wl.mids)
+					mBranch, mIndent := treeBranch(anc2, isLastGroup)
+					fmt.Printf("%s%s\n", mBranch, strings.Title(kindKey))
+					if kindKey == "job" {
+						jw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+						prefix := mIndent + "|"
+						fmt.Fprintf(jw, "%sNAMESPACE\tNAME\tSTATUS\tCOMPLETIONS\tDURATION\tAGE\n", prefix)
+						for k := mi; k < j; k++ {
+							it := wl.mids[k]
+							fmt.Fprintf(jw, "%s%s\t%s\t%s\t%s\t%s\t%s\n", prefix, r.Namespace, it.Name, valueOrDash(it.JobStatus), valueOrDash(it.JobCompletions), valueOrDash(it.JobDuration), valueOrDash(it.Age))
+						}
+						_ = jw.Flush()
+					} else {
+						for k := mi; k < j; k++ {
+							it := wl.mids[k]
+							fmt.Printf("%s|%s/%s pods=%d\n", mIndent, kindKey, it.Name, len(it.pods))
+						}
+					}
+					mi = j
 				}
 			}
 		}
@@ -919,6 +1176,22 @@ func valueOrDash(s string) string {
 		return "-"
 	}
 	return s
+}
+
+func nodeSelectorString(sel map[string]string) string {
+	if len(sel) == 0 {
+		return "<none>"
+	}
+	keys := make([]string, 0, len(sel))
+	for k := range sel {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	out := make([]string, 0, len(keys))
+	for _, k := range keys {
+		out = append(out, k+"="+sel[k])
+	}
+	return strings.Join(out, ",")
 }
 
 func namespacePodCount(n namespaceTopo) int {
@@ -1050,6 +1323,34 @@ func getDeployment(ctx context.Context, clientset *kubernetes.Clientset, ns, nam
 	return d, nil
 }
 
+func getStatefulSet(ctx context.Context, clientset *kubernetes.Clientset, ns, name string, cache map[string]*appsv1.StatefulSet) (*appsv1.StatefulSet, error) {
+	key := ns + "/" + name
+	if v, ok := cache[key]; ok {
+		return v, nil
+	}
+	sts, err := clientset.AppsV1().StatefulSets(ns).Get(ctx, name, metav1.GetOptions{})
+	if err != nil {
+		cache[key] = nil
+		return nil, nil
+	}
+	cache[key] = sts
+	return sts, nil
+}
+
+func getDaemonSet(ctx context.Context, clientset *kubernetes.Clientset, ns, name string, cache map[string]*appsv1.DaemonSet) (*appsv1.DaemonSet, error) {
+	key := ns + "/" + name
+	if v, ok := cache[key]; ok {
+		return v, nil
+	}
+	ds, err := clientset.AppsV1().DaemonSets(ns).Get(ctx, name, metav1.GetOptions{})
+	if err != nil {
+		cache[key] = nil
+		return nil, nil
+	}
+	cache[key] = ds
+	return ds, nil
+}
+
 func buildClientset(kubeconfigPath string) (*kubernetes.Clientset, string, error) {
 	loadingRules := clientcmd.NewDefaultClientConfigLoadingRules()
 	if kubeconfigPath != "" {
@@ -1107,4 +1408,68 @@ func getJob(ctx context.Context, clientset *kubernetes.Clientset, ns, name strin
 	}
 	cache[key] = j
 	return j, nil
+}
+
+func getCronJob(ctx context.Context, clientset *kubernetes.Clientset, ns, name string, cache map[string]*batchv1.CronJob) (*batchv1.CronJob, error) {
+	key := ns + "/" + name
+	if v, ok := cache[key]; ok {
+		return v, nil
+	}
+	cj, err := clientset.BatchV1().CronJobs(ns).Get(ctx, name, metav1.GetOptions{})
+	if err != nil {
+		cache[key] = nil
+		return nil, nil
+	}
+	cache[key] = cj
+	return cj, nil
+}
+
+func boolString(v bool) string {
+	if v {
+		return "True"
+	}
+	return "False"
+}
+
+func jobStatusString(j *batchv1.Job) string {
+	if j == nil {
+		return ""
+	}
+	if j.Status.Active > 0 {
+		return "Running"
+	}
+	if j.Status.Failed > 0 && j.Status.Succeeded == 0 {
+		return "Failed"
+	}
+	if j.Status.Succeeded > 0 {
+		return "Complete"
+	}
+	return "Pending"
+}
+
+func jobCompletionsString(j *batchv1.Job) string {
+	if j == nil {
+		return ""
+	}
+	desired := int32(1)
+	if j.Spec.Completions != nil {
+		desired = *j.Spec.Completions
+	}
+	return fmt.Sprintf("%d/%d", j.Status.Succeeded, desired)
+}
+
+func jobDurationString(j *batchv1.Job) string {
+	if j == nil || j.Status.StartTime == nil {
+		return ""
+	}
+	start := j.Status.StartTime.Time
+	end := time.Now()
+	if j.Status.CompletionTime != nil {
+		end = j.Status.CompletionTime.Time
+	}
+	d := end.Sub(start)
+	if d < 0 {
+		d = -d
+	}
+	return duration.HumanDuration(d)
 }
