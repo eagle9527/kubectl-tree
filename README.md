@@ -119,6 +119,7 @@ kubectl tree -n default --topo-scope=ingress --ingress nginx
 - `--ingress <name>`：指定 Ingress 名称（当前实现按 `-n/--namespace` 指定的命名空间读取；scope 为 `ingress` 时必填）
 - `--topo-scope node|namespace|ingress`：显式指定输出视角
 - `--topo=node|namespace|ingress`：`--topo-scope` 的等价写法
+- `--workload, --wl <name|kind/name>`：按工作负载过滤输出（示例：`--workload kubernetes-evicted-cleanup` 或 `--workload cronjob/anomaly-detection`）
 - `--include-standalone-pods`：包含无控制器的 Pod（否则默认跳过）
 - `--timeout <duration>`：请求超时（默认 20s），示例：`--timeout 60s`
 
@@ -239,5 +240,6 @@ kubectl tree -n default --topo-scope=ingress --ingress nginx
 - `--ingress <name>`: ingress name (looked up in the namespace from `-n/--namespace`; required when scope is `ingress`)
 - `--topo-scope node|namespace|ingress`: set scope explicitly
 - `--topo=node|namespace|ingress`: shorthand for `--topo-scope`
+- `--workload, --wl <name|kind/name>`: filter output by workload (e.g. `--workload kubernetes-evicted-cleanup` or `--workload cronjob/anomaly-detection`)
 - `--include-standalone-pods`: include pods without controllers (skipped by default)
 - `--timeout <duration>`: request timeout (default: 20s), e.g. `--timeout 60s`

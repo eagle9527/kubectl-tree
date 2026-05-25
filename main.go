@@ -28,6 +28,7 @@ type options struct {
 	allNamespaces         bool
 	nodeName              string
 	ingressName           string
+	workload              string
 	topologyScope         string
 	includeStandalonePods bool
 	timeout               time.Duration
@@ -42,6 +43,8 @@ func main() {
 	flag.BoolVar(&o.allNamespaces, "all-namespaces", false, "")
 	flag.StringVar(&o.nodeName, "node", "", "")
 	flag.StringVar(&o.ingressName, "ingress", "", "")
+	flag.StringVar(&o.workload, "workload", "", "")
+	flag.StringVar(&o.workload, "wl", "", "")
 	flag.StringVar(&o.topologyScope, "topo-scope", "", "")
 	flag.BoolVar(&o.includeStandalonePods, "include-standalone-pods", false, "")
 	flag.DurationVar(&o.timeout, "timeout", 20*time.Second, "")
@@ -113,6 +116,7 @@ func run(o options) error {
 		if err != nil {
 			return err
 		}
+		rows = filterNamespaceTopologyByWorkload(rows, o.workload)
 		podsTotal := 0
 		for i := range rows {
 			podsTotal += namespacePodCount(rows[i])
@@ -127,6 +131,7 @@ func run(o options) error {
 		if err != nil {
 			return err
 		}
+		rows = filterNamespaceTopologyByWorkload(rows, o.workload)
 		sortNamespaceTopology(rows)
 		printNamespaceTopology(rows)
 		return nil
@@ -138,6 +143,7 @@ func run(o options) error {
 		if err != nil {
 			return err
 		}
+		rows = filterIngressTopologyByWorkload(rows, o.workload)
 		sortIngressTopology(rows)
 		printIngressTopology(rows)
 		return nil
@@ -833,6 +839,69 @@ func sortIngressTopology(rows []ingressTopo) {
 			})
 		}
 	}
+}
+
+func filterNamespaceTopologyByWorkload(rows []namespaceTopo, workload string) []namespaceTopo {
+	f := strings.TrimSpace(workload)
+	if f == "" {
+		return rows
+	}
+	out := make([]namespaceTopo, 0, len(rows))
+	for _, n := range rows {
+		wls := make([]workloadTopo, 0, len(n.workloads))
+		for _, wl := range n.workloads {
+			if matchWorkloadFilter(wl.Kind, wl.Name, f) {
+				wls = append(wls, wl)
+			}
+		}
+		if len(wls) == 0 {
+			continue
+		}
+		n.workloads = wls
+		out = append(out, n)
+	}
+	return out
+}
+
+func filterIngressTopologyByWorkload(rows []ingressTopo, workload string) []ingressTopo {
+	f := strings.TrimSpace(workload)
+	if f == "" {
+		return rows
+	}
+	out := make([]ingressTopo, 0, len(rows))
+	for _, r := range rows {
+		services := make([]serviceTopo, 0, len(r.services))
+		for _, s := range r.services {
+			wls := make([]workloadTopo, 0, len(s.workloads))
+			for _, wl := range s.workloads {
+				if matchWorkloadFilter(wl.Kind, wl.Name, f) {
+					wls = append(wls, wl)
+				}
+			}
+			s.workloads = wls
+			if len(s.workloads) == 0 {
+				continue
+			}
+			services = append(services, s)
+		}
+		r.services = services
+		out = append(out, r)
+	}
+	return out
+}
+
+func matchWorkloadFilter(kind, name, filter string) bool {
+	f := strings.TrimSpace(filter)
+	if f == "" {
+		return true
+	}
+	if strings.Contains(f, "/") {
+		parts := strings.SplitN(f, "/", 2)
+		fKind := strings.ToLower(strings.TrimSpace(parts[0]))
+		fName := strings.TrimSpace(parts[1])
+		return strings.EqualFold(topoKind(kind), fKind) && name == fName
+	}
+	return name == f
 }
 
 func printNamespaceTopology(rows []namespaceTopo) {
